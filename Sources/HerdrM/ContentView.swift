@@ -55,6 +55,9 @@ struct RootView: View {
         .sheet(isPresented: $model.showNewAgent) { NewAgentSheet(model: model) }
         .sheet(isPresented: $model.showNewSpace) { NewSpaceSheet(model: model) }
         .sheet(item: $model.deviceToEdit) { device in EditDeviceSheet(model: model, device: device) }
+        .sheet(item: $model.sshAuthenticationRequest) { request in
+            SSHAuthenticationSheet(model: model, request: request)
+        }
         .alert(
             "Something went wrong",
             isPresented: Binding(
@@ -258,7 +261,7 @@ struct AddDeviceSheet: View {
             SheetHeader(
                 systemImage: "desktopcomputer",
                 title: "Add Device",
-                subtitle: "Must run herdr and be reachable over SSH with your local keys"
+                subtitle: "Uses OpenSSH config, agent, Tailscale SSH, or password"
             )
             Rectangle().fill(Theme.hairline).frame(height: 1)
 
@@ -297,6 +300,56 @@ struct AddDeviceSheet: View {
             .padding(.vertical, 12)
         }
         .frame(width: 400)
+    }
+}
+
+struct SSHAuthenticationSheet: View {
+    @ObservedObject var model: AppModel
+    let request: SSHAuthenticationRequest
+    @State private var password = ""
+    @FocusState private var passwordFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SheetHeader(
+                systemImage: "key.fill",
+                title: "SSH Authentication",
+                subtitle: request.target
+            )
+            Rectangle().fill(Theme.hairline).frame(height: 1)
+
+            VStack(alignment: .leading, spacing: 8) {
+                SheetSectionLabel("PASSWORD")
+                SecureField("SSH password", text: $password)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($passwordFocused)
+                Label(SSHCredentialStore.persistenceDescription, systemImage: "lock.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textTertiary)
+            }
+            .padding(16)
+
+            Rectangle().fill(Theme.hairline).frame(height: 1)
+
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    model.sshAuthenticationRequest = nil
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Connect") {
+                    model.saveSSHPassword(password, for: request)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.accent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(password.isEmpty)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+        .frame(width: 400)
+        .onAppear { passwordFocused = true }
     }
 }
 

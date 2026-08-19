@@ -11,7 +11,7 @@ public actor HerdrService {
     public init(device: Device) {
         self.device = device
         if let target = device.sshTarget {
-            self.tunnel = SSHTunnel(target: target)
+            self.tunnel = SSHTunnel(target: target, credentialID: device.id)
         }
     }
 
@@ -102,7 +102,12 @@ public actor HerdrService {
         case .local:
             output = try await Self.runLocalShell(script)
         case .ssh(let target):
-            output = try await SSHTunnel.runSSH(target: target, command: script, timeout: 15)
+            output = try await SSHTunnel.runSSH(
+                target: target,
+                command: script,
+                timeout: 15,
+                credentialID: device.id
+            )
         }
         let found = Set(output.split(separator: "\n").map(String.init))
         return kinds.filter { found.contains(Self.binaryName(for: $0)) }
@@ -175,16 +180,90 @@ public actor HerdrService {
         return paneID
     }
 
-    public func startAgent(name: String, kind: String, paneID: String, args: [String] = []) async throws {
-        _ = try await client().request(
-            method: "agent.start",
-            params: .object([
-                "name": .string(name),
-                "kind": .string(kind),
-                "pane_id": .string(paneID),
-                "args": .array(args.map { .string($0) }),
-            ])
+    public func startAgent(
+        name: String,
+        kind: String,
+        paneID: String,
+        args: [String] = [],
+        waitForShell: Bool = false
+    ) async throws {
+        let pinnedTerminalID = waitForShell ? try await paneTerminalID(paneID) : nil
+        let clock = ContinuousClock()
+        let retryDeadline = clock.now.advanced(by: .seconds(2))
+
+        while true {
+            do {
+                _ = try await client().request(
+                    method: "agent.start",
+                    params: .object([
+                        "name": .string(name),
+                        "kind": .string(kind),
+                        "pane_id": .string(paneID),
+                        "args": .array(args.map { .string($0) }),
+                    ])
+                )
+                return
+            } catch let error as HerdrError {
+                guard waitForShell,
+                      case .rpc(let code, _) = error,
+                      code == "agent_pane_busy",
+                      clock.now < retryDeadline,
+                      let pinnedTerminalID,
+                      try await paneTerminalID(paneID) == pinnedTerminalID,
+                      try await paneShellIsInitializing(paneID)
+                else { throw error }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        }
+    }
+
+    private func paneTerminalID(_ paneID: String) async throws -> String? {
+        let result = try await client().request(
+            method: "pane.get",
+            params: .object(["pane_id": .string(paneID)])
         )
+        return result["pane"]?["terminal_id"]?.stringValue
+    }
+
+    private func paneShellIsInitializing(_ paneID: String) async throws -> Bool {
+        let result = try await client().request(
+            method: "pane.process_info",
+            params: .object(["pane_id": .string(paneID)])
+        )
+        guard let processInfo = result["process_info"] else { return false }
+        return Self.processInfoShowsShellInitialization(processInfo)
+    }
+
+    static func processInfoShowsShellInitialization(_ processInfo: JSONValue) -> Bool {
+        guard let shellPID = integer(processInfo["shell_pid"]),
+              integer(processInfo["foreground_process_group_id"]) == shellPID
+        else { return false }
+        return processInfo["foreground_processes"]?.arrayValue?.contains { process in
+            guard integer(process["pid"]) == shellPID else { return false }
+            let name = process["name"]?.stringValue
+            let argv0 = process["argv"]?.arrayValue?.first?.stringValue
+            return name.map(isPaneShellProcessName) == true
+                || argv0.map(isPaneShellProcessName) == true
+        } == true
+    }
+
+    private static func integer(_ value: JSONValue?) -> UInt64? {
+        guard case .number(let number)? = value else { return nil }
+        return UInt64(exactly: number)
+    }
+
+    private static func isPaneShellProcessName(_ value: String) -> Bool {
+        var name = value
+            .split(whereSeparator: { $0 == "/" || $0 == "\\" })
+            .last
+            .map(String.init) ?? value
+        while name.hasPrefix("-") { name.removeFirst() }
+        name = name.lowercased()
+        if name.hasSuffix(".exe") { name.removeLast(4) }
+        return [
+            "sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "csh", "tcsh",
+            "elvish", "xonsh", "nu", "pwsh", "powershell", "cmd",
+        ].contains(name)
     }
 
     /// Reads the pane's visible screen with ANSI intact. Returns nil text when unchanged
@@ -248,20 +327,27 @@ public actor HerdrService {
     // MARK: - Terminal attach
 
     /// The command the embedded terminal should spawn to attach to a pane.
-    public nonisolated func attachCommand(paneID: String) -> (executable: String, args: [String]) {
+    public nonisolated func attachCommand(
+        paneID: String
+    ) -> (executable: String, args: [String], environment: [String: String], authorizationID: UUID?) {
         switch device.kind {
         case .local:
             // GUI apps launched from Finder don't inherit a login-shell PATH.
             let local = "\(SSHTunnel.remotePathExport); exec herdr agent attach '\(paneID)' --takeover"
-            return ("/bin/sh", ["-c", local])
+            return ("/bin/sh", ["-c", local], [:], nil)
         case .ssh(let target):
             let remote = "\(SSHTunnel.remotePathExport); exec herdr agent attach '\(paneID)' --takeover"
-            return ("/usr/bin/ssh", [
-                "-tt",
-                "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=accept-new",
-                target, remote,
-            ])
+            let authentication = SSHTunnel.authenticationConfiguration(for: device.id)
+            return (
+                "/usr/bin/ssh",
+                ["-tt"] + authentication.arguments + [
+                    "-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "ConnectTimeout=10",
+                    target, remote,
+                ],
+                authentication.environment,
+                authentication.authorizationID
+            )
         }
     }
 }
