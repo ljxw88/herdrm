@@ -204,7 +204,6 @@ public actor SSHTunnel {
             environment: [
                 "SSH_ASKPASS": executablePath,
                 "SSH_ASKPASS_REQUIRE": "force",
-                "DISPLAY": "herdrm:0",
                 SSHCredentialStore.askPassModeEnvironmentKey: "1",
                 SSHCredentialStore.authorizationIDEnvironmentKey: authorizationID.uuidString,
             ],

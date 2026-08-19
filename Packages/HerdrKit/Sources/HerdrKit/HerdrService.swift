@@ -187,9 +187,12 @@ public actor HerdrService {
         args: [String] = [],
         waitForShell: Bool = false
     ) async throws {
-        let pinnedTerminalID = waitForShell ? try await paneTerminalID(paneID) : nil
+        var pinnedTerminalID: String?
+        if waitForShell {
+            pinnedTerminalID = try? await paneTerminalID(paneID)
+        }
         let clock = ContinuousClock()
-        let retryDeadline = clock.now.advanced(by: .seconds(2))
+        let retryDeadline = clock.now.advanced(by: Self.paneShellReadinessTimeout)
 
         while true {
             do {
@@ -204,17 +207,31 @@ public actor HerdrService {
                 )
                 return
             } catch let error as HerdrError {
+                // Probe failures must not replace the server's original error.
                 guard waitForShell,
-                      case .rpc(let code, _) = error,
-                      code == "agent_pane_busy",
+                      Self.isPaneBusy(error),
                       clock.now < retryDeadline,
                       let pinnedTerminalID,
-                      try await paneTerminalID(paneID) == pinnedTerminalID,
-                      try await paneShellIsInitializing(paneID)
+                      await paneShellStillInitializing(paneID, pinnedTerminalID: pinnedTerminalID)
                 else { throw error }
                 try await Task.sleep(for: .milliseconds(100))
             }
         }
+    }
+
+    static let paneShellReadinessTimeout: Duration = .seconds(2)
+
+    static func isPaneBusy(_ error: HerdrError) -> Bool {
+        guard case .rpc(let code, _) = error else { return false }
+        return code == "agent_pane_busy"
+    }
+
+    private func paneShellStillInitializing(_ paneID: String, pinnedTerminalID: String) async -> Bool {
+        guard let terminalID = try? await paneTerminalID(paneID),
+              terminalID == pinnedTerminalID,
+              let initializing = try? await paneShellIsInitializing(paneID)
+        else { return false }
+        return initializing
     }
 
     private func paneTerminalID(_ paneID: String) async throws -> String? {
@@ -327,27 +344,33 @@ public actor HerdrService {
     // MARK: - Terminal attach
 
     /// The command the embedded terminal should spawn to attach to a pane.
-    public nonisolated func attachCommand(
-        paneID: String
-    ) -> (executable: String, args: [String], environment: [String: String], authorizationID: UUID?) {
+    public nonisolated func attachCommand(paneID: String) -> AttachCommand {
         switch device.kind {
         case .local:
             // GUI apps launched from Finder don't inherit a login-shell PATH.
             let local = "\(SSHTunnel.remotePathExport); exec herdr agent attach '\(paneID)' --takeover"
-            return ("/bin/sh", ["-c", local], [:], nil)
+            return AttachCommand(executable: "/bin/sh", args: ["-c", local], environment: [:], authorizationID: nil)
         case .ssh(let target):
             let remote = "\(SSHTunnel.remotePathExport); exec herdr agent attach '\(paneID)' --takeover"
             let authentication = SSHTunnel.authenticationConfiguration(for: device.id)
-            return (
-                "/usr/bin/ssh",
-                ["-tt"] + authentication.arguments + [
+            return AttachCommand(
+                executable: "/usr/bin/ssh",
+                args: ["-tt"] + authentication.arguments + [
                     "-o", "StrictHostKeyChecking=accept-new",
                     "-o", "ConnectTimeout=10",
                     target, remote,
                 ],
-                authentication.environment,
-                authentication.authorizationID
+                environment: authentication.environment,
+                authorizationID: authentication.authorizationID
             )
         }
     }
+}
+
+public struct AttachCommand: Sendable {
+    public let executable: String
+    public let args: [String]
+    public let environment: [String: String]
+    /// Single-use askpass grant; the caller must discard it once the process exits.
+    public let authorizationID: UUID?
 }

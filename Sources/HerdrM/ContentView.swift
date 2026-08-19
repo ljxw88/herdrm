@@ -224,6 +224,11 @@ struct DetailView: View {
                         model.showNewAgent = true
                     }
                     .controlSize(.small)
+                } else if model.hasReconnectableDevice {
+                    Button("Reconnect") {
+                        model.reconnectFailedDevices()
+                    }
+                    .controlSize(.small)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -334,7 +339,7 @@ struct SSHAuthenticationSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel") {
-                    model.sshAuthenticationRequest = nil
+                    model.cancelSSHAuthentication(for: request)
                 }
                 .keyboardShortcut(.cancelAction)
                 Button("Connect") {

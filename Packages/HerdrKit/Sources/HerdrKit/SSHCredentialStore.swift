@@ -10,10 +10,7 @@ public enum SSHCredentialStore {
     private static let authorizationService = "dev.bybee.herdrm.ssh-authorization"
 
     public static func password(for deviceID: UUID) throws -> String? {
-        if let password = try keychainPassword(for: deviceID) {
-            try? removeLegacyLocalData(directory: "passwords", id: deviceID)
-            return password
-        }
+        if let password = try keychainPassword(for: deviceID) { return password }
 
         // Migrate credentials written by the short-lived Debug file-store implementation.
         guard let legacyData = try legacyLocalData(directory: "passwords", id: deviceID) else {
@@ -23,10 +20,6 @@ public enum SSHCredentialStore {
         try setKeychainPassword(password, for: deviceID)
         try removeLegacyLocalData(directory: "passwords", id: deviceID)
         return password
-    }
-
-    public static func hasPassword(for deviceID: UUID) -> Bool {
-        (try? password(for: deviceID)) != nil
     }
 
     public static func setPassword(_ password: String, for deviceID: UUID) throws {
@@ -48,10 +41,19 @@ public enum SSHCredentialStore {
         let authorizationID = UUID()
         var item = keychainQuery(service: authorizationService, account: authorizationID.uuidString)
         item[kSecValueData as String] = Data(deviceID.uuidString.utf8)
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         let status = SecItemAdd(item as CFDictionary, nil)
         guard status == errSecSuccess else { throw SSHCredentialStoreError(status: status) }
         return authorizationID
+    }
+
+    /// Drops grants stranded by a crash between creation and askpass consumption.
+    public static func purgeAuthorizations() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: authorizationService,
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 
     public static func consumePassword(authorizationID: UUID) throws -> String? {
@@ -92,12 +94,11 @@ public enum SSHCredentialStore {
     }
 
     private static func setKeychainPassword(_ password: String, for deviceID: UUID) throws {
-
         let passwordData = Data(password.utf8)
         let query = keychainQuery(service: passwordService, account: deviceID.uuidString)
         let attributes: [String: Any] = [
             kSecValueData as String: passwordData,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         ]
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if updateStatus == errSecSuccess { return }
@@ -107,7 +108,7 @@ public enum SSHCredentialStore {
 
         var newItem = query
         newItem[kSecValueData as String] = passwordData
-        newItem[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+        newItem[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         let addStatus = SecItemAdd(newItem as CFDictionary, nil)
         guard addStatus == errSecSuccess else { throw SSHCredentialStoreError(status: addStatus) }
     }

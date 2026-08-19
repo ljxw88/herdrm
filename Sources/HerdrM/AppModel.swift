@@ -303,6 +303,30 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Leaves the device disconnected but recoverable; the reconnect loop stopped at the prompt.
+    func cancelSSHAuthentication(for request: SSHAuthenticationRequest) {
+        sshAuthenticationRequest = nil
+        sessions[request.deviceID]?.connection =
+            .failed("Authentication cancelled — choose Reconnect to try again")
+    }
+
+    var hasReconnectableDevice: Bool {
+        devicesInScope.contains { isFailed($0.id) }
+    }
+
+    func reconnectFailedDevices() {
+        for device in devicesInScope where isFailed(device.id) {
+            stopSession(device.id)
+            startSession(device)
+            probeOSIfNeeded(device)
+        }
+    }
+
+    private func isFailed(_ deviceID: UUID) -> Bool {
+        if case .failed = session(deviceID).connection { return true }
+        return false
+    }
+
     /// Renames a device and/or updates its SSH target (e.g. after an IP change).
     func updateDevice(_ id: UUID, name: String, sshTarget: String) {
         guard let index = devices.firstIndex(where: { $0.id == id }), !devices[index].isLocal else { return }
@@ -415,8 +439,12 @@ final class AppModel: ObservableObject {
         guard let herdrError = error as? HerdrError,
               case .tunnelFailed(let reason) = herdrError
         else { return false }
-        return reason.localizedCaseInsensitiveContains("permission denied")
-            || reason.localizedCaseInsensitiveContains("authentication failed")
+        return [
+            "permission denied",
+            "authentication failed",
+            "too many authentication failures",
+            "no supported authentication methods",
+        ].contains { reason.localizedCaseInsensitiveContains($0) }
     }
 
     private func removeSSHPassword(for deviceID: UUID) {

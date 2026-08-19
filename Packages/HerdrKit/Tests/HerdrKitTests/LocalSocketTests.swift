@@ -61,6 +61,13 @@ final class LocalSocketTests: XCTestCase {
         XCTAssertEqual(AgentStatus(wire: nil), .unknown)
     }
 
+    func testOnlyPaneBusyErrorsAreRetryable() {
+        XCTAssertTrue(HerdrService.isPaneBusy(.rpc(code: "agent_pane_busy", message: "busy")))
+        XCTAssertFalse(HerdrService.isPaneBusy(.rpc(code: "agent_name_taken", message: "taken")))
+        XCTAssertFalse(HerdrService.isPaneBusy(.rpc(code: "agent_pane_unavailable", message: "gone")))
+        XCTAssertFalse(HerdrService.isPaneBusy(.connectionFailed("dropped")))
+    }
+
     func testShellInitializationProcessInfoRequiresThePaneShellInForeground() {
         let initializing: JSONValue = .object([
             "shell_pid": .number(42),

@@ -14,6 +14,7 @@ struct HerdrMApp: App {
         if ProcessInfo.processInfo.environment[SSHCredentialStore.askPassModeEnvironmentKey] == "1" {
             Self.runSSHAskPass()
         }
+        SSHCredentialStore.purgeAuthorizations()
         updaterController = SPUStandardUpdaterController(
             startingUpdater: true,
             updaterDelegate: nil,
@@ -54,7 +55,7 @@ struct HerdrMApp: App {
 
     private static func runSSHAskPass() -> Never {
         let environment = ProcessInfo.processInfo.environment
-          guard let rawID = environment[SSHCredentialStore.authorizationIDEnvironmentKey],
+        guard let rawID = environment[SSHCredentialStore.authorizationIDEnvironmentKey],
               let authorizationID = UUID(uuidString: rawID),
               let password = try? SSHCredentialStore.consumePassword(authorizationID: authorizationID)
         else {
