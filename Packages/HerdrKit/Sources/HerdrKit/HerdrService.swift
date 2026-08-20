@@ -5,14 +5,28 @@ public actor HerdrService {
     public let device: Device
     private var tunnel: SSHTunnel?
     private var rpc: SocketRPC?
+    /// nil for remote devices and when auto-start is off; remotes are the user's to run.
+    private let localServer: LocalHerdrServer?
+    /// Auto-start is for a server that was never there, not for one that went away: see
+    /// `ping(_:socketPath:)`.
+    private var everConnected = false
 
     public static let minimumProtocolVersion = 17
 
-    public init(device: Device) {
+    public init(device: Device, autoStartLocalServer: Bool = true) {
+        self.init(
+            device: device,
+            localServer: device.isLocal && autoStartLocalServer ? LocalHerdrServer() : nil
+        )
+    }
+
+    /// Seam for tests: injects the auto-start collaborator, nil turning it off.
+    init(device: Device, localServer: LocalHerdrServer?) {
         self.device = device
         if let target = device.sshTarget {
             self.tunnel = SSHTunnel(target: target, credentialID: device.id)
         }
+        self.localServer = localServer
     }
 
     // MARK: - Connection
@@ -28,12 +42,85 @@ public actor HerdrService {
             socketPath = try await tunnel.ensureUp()
         }
         let client = SocketRPC(socketPath: socketPath)
-        let pong = try await client.request(method: "ping", params: .object([:]), as: PingResult.self)
+        let pong: PingResult
+        do {
+            pong = try await ping(client, socketPath: socketPath)
+        } catch {
+            // Two diagnosis routes compose here. The probe is definitive (it asks the
+            // remote whether the socket exists) but only fits the silent-forward shape;
+            // ssh's captured stderr is the generic fallback — often just
+            // "connect failed: open failed", and blind when ControlMaster muxes the
+            // host, which is exactly what the probe covers.
+            if let tunnel {
+                if let herdrError = error as? HerdrError, Self.isSilentForward(herdrError),
+                   let diagnosis = await tunnel.diagnoseSilentForward() {
+                    await tunnel.tearDown()
+                    throw diagnosis
+                }
+                if let forwardingFailure = await tunnel.forwardingFailure() {
+                    await tunnel.tearDown()
+                    throw HerdrError.tunnelFailed(forwardingFailure)
+                }
+            }
+            throw error
+        }
         guard pong.protocolVersion >= Self.minimumProtocolVersion else {
             throw HerdrError.incompatibleProtocol(pong.protocolVersion)
         }
         rpc = client
+        everConnected = true
         return pong
+    }
+
+    /// Test seam: whether this service would start a local server at all.
+    var autoStartsLocalServer: Bool { localServer != nil }
+
+    /// Pings; when the local server was never reachable in this session, starts it and pings
+    /// again, so the app boots without the user opening a terminal to run `herdr`.
+    ///
+    /// A server that already answered here and is gone now was stopped deliberately — by
+    /// `herdr server stop`, or by the restart in the middle of `herdr update` — and bringing
+    /// it back would both undo the user's decision and let herdrm win the bind race that
+    /// `herdr update` needs. The guard is per service instance rather than per process on
+    /// purpose: Reconnect and the backoff loop must still be able to start a server for
+    /// someone who installed or repaired herdr after opening the app.
+    private func ping(_ client: SocketRPC, socketPath: String) async throws -> PingResult {
+        do {
+            return try await client.request(method: "ping", params: .object([:]), as: PingResult.self)
+        } catch let error as HerdrError where Self.isServerDown(error) {
+            guard let localServer, !everConnected else { throw error }
+            try await localServer.ensureRunning(socketPath: socketPath)
+            return try await client.request(method: "ping", params: .object([:]), as: PingResult.self)
+        }
+    }
+
+    /// The two shapes a missing server takes: no socket file at all, or a file whose
+    /// `connect()` is refused because nobody is listening.
+    ///
+    /// Nothing else qualifies, and the strictness is the point: `SocketRPC` reports a failed
+    /// `read()` (the 15 s timeout — a hung but live server), `write()` or `socket()` through
+    /// the same `connectionFailed` case, and every one of those proves somebody was on the
+    /// other end. Treating them as "no server" would start a second daemon on top of a live
+    /// one. Matched on the text `SocketRPC.connect` builds — `"connect(): \(strerror)"` — the
+    /// way `AppModel.isSSHAuthenticationFailure` already matches OpenSSH's wording.
+    static func isServerDown(_ error: HerdrError) -> Bool {
+        switch error {
+        case .socketUnavailable: return true
+        case .connectionFailed(let reason):
+            return reason.contains("connect():") && reason.contains("Connection refused")
+        default: return false
+        }
+    }
+
+    /// The shape a dead SSH forward takes: the tunnel is up, ssh accepts the local
+    /// connection, fails to open the remote side, and closes it — the first read hits
+    /// EOF and the reply comes back empty. Matched on the text
+    /// `SocketRPC.decodeResponse` builds, the way `isServerDown` matches `connect()`'s
+    /// wording. Everything else proves somebody replied (or the local socket itself
+    /// failed) and must surface unchanged.
+    static func isSilentForward(_ error: HerdrError) -> Bool {
+        if case .malformedResponse("empty reply") = error { return true }
+        return false
     }
 
     public func disconnect() async {
@@ -153,6 +240,49 @@ public actor HerdrService {
             guard let tunnel else { throw HerdrError.tunnelFailed("missing tunnel") }
             return try await tunnel.probeRemoteHome()
         }
+    }
+
+    /// "~" and "~/…" resolve against this device's home; anything else passes through.
+    public func absolutePath(_ path: String) async throws -> String {
+        if path == "~" { return try await homeDirectory() }
+        if path.hasPrefix("~/") { return try await homeDirectory() + "/" + path.dropFirst(2) }
+        return path
+    }
+
+    /// The visible subdirectories of a directory on this device ("~"-relative paths
+    /// allowed), sorted the way Finder sorts. Feeds the New Space directory browser.
+    /// Throws when the directory can't be read — callers decide how quiet to be.
+    public func listDirectories(at path: String) async throws -> [String] {
+        let absolute = try await absolutePath(path)
+        let names: [String]
+        switch device.kind {
+        case .local:
+            let manager = FileManager.default
+            names = try manager.contentsOfDirectory(atPath: absolute).filter { name in
+                guard !name.hasPrefix(".") else { return false }
+                var isDirectory: ObjCBool = false
+                // fileExists follows symlinks, so a linked project directory still lists.
+                return manager.fileExists(atPath: "\(absolute)/\(name)", isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+            }
+        case .ssh(let target):
+            let output = try await SSHTunnel.runSSH(
+                target: target,
+                command: "cd \(Self.shellQuoted(absolute)) && LC_ALL=C ls -1p",
+                timeout: 15,
+                credentialID: device.id
+            )
+            names = output.split(separator: "\n").compactMap { line in
+                line.hasSuffix("/") ? String(line.dropLast()) : nil
+            }
+        }
+        return names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    /// Wraps a path for the remote shell. Single quotes so nothing inside expands;
+    /// the quote dance survives sh, zsh, and fish login shells alike.
+    static func shellQuoted(_ path: String) -> String {
+        "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Creates a workspace (herdr "space") rooted at a directory.
@@ -353,22 +483,47 @@ public actor HerdrService {
 
     // MARK: - Terminal attach
 
+    /// Shell fragment that picks the herdr binary to attach with. herdr's attach
+    /// stream requires the CLI and server protocol versions to match exactly, so
+    /// when several herdr binaries share the PATH (a stale copy in ~/.local/bin
+    /// next to an updated /usr/local/bin install), blindly taking the first one
+    /// yields `protocol_mismatch`. When the server version is known, every PATH
+    /// candidate is tried for an exact `--version` match first; the first-found
+    /// binary stays the fallback either way.
+    static func attachBinarySelection(serverVersion: String?) -> String {
+        guard let serverVersion, !serverVersion.isEmpty,
+              serverVersion.allSatisfy({ $0.isNumber || $0 == "." })
+        else { return "hb=herdr" }
+        // A manual PATH walk: `command -v -a` isn't POSIX and silently returns
+        // only the first match under macOS /bin/sh.
+        return "hb=''; oldifs=$IFS; IFS=:; for d in $PATH; do c=\"$d/herdr\"; [ -x \"$c\" ] || continue; "
+            + "[ \"$(\"$c\" --version 2>/dev/null | awk '{print $NF}')\" = '\(serverVersion)' ] && { hb=\"$c\"; break; }; "
+            + "done; IFS=$oldifs; [ -n \"$hb\" ] || hb=herdr"
+    }
+
     /// The command the embedded terminal should spawn to attach to a pane.
-    public nonisolated func attachCommand(paneID: String) -> AttachCommand {
+    /// `serverVersion` (from the device's last successful ping) lets the attach
+    /// pick a herdr binary whose protocol matches the server's — see
+    /// `attachBinarySelection`.
+    public nonisolated func attachCommand(paneID: String, serverVersion: String? = nil) -> AttachCommand {
+        // GUI apps launched from Finder don't inherit a login-shell PATH, and
+        // sshd exec is not a login shell either — hence the PATH export.
+        let script = "\(SSHTunnel.remotePathExport); \(Self.attachBinarySelection(serverVersion: serverVersion)); "
+            + "exec \"$hb\" agent attach '\(paneID)' --takeover"
         switch device.kind {
         case .local:
-            // GUI apps launched from Finder don't inherit a login-shell PATH.
-            let local = "\(SSHTunnel.remotePathExport); exec herdr agent attach '\(paneID)' --takeover"
-            return AttachCommand(executable: "/bin/sh", args: ["-c", local], environment: [:], authorizationID: nil)
+            return AttachCommand(executable: "/bin/sh", args: ["-c", script], environment: [:], authorizationID: nil)
         case .ssh(let target):
-            let remote = "\(SSHTunnel.remotePathExport); exec herdr agent attach '\(paneID)' --takeover"
+            // Wrapped in sh explicitly: the ssh remote command runs in the user's
+            // login shell, and the script's sh syntax must not depend on it.
+            let remote = "exec /bin/sh -c \(Self.shellQuoted(script))"
             let authentication = SSHTunnel.authenticationConfiguration(for: device.id)
             return AttachCommand(
                 executable: "/usr/bin/ssh",
                 args: ["-tt"] + authentication.arguments + [
                     "-o", "StrictHostKeyChecking=accept-new",
                     "-o", "ConnectTimeout=10",
-                    target, remote,
+                    SSHTunnel.sshDestination(target), remote,
                 ],
                 environment: authentication.environment,
                 authorizationID: authentication.authorizationID

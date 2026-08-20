@@ -86,6 +86,13 @@ final class AppModel: ObservableObject {
         sessions[id] ?? DeviceSessionState()
     }
 
+    /// The herdr version the device's server reported on its last successful
+    /// ping; the terminal attach uses it to pick a protocol-matching CLI binary.
+    func serverVersion(deviceID: UUID) -> String? {
+        if case .connected(let version) = session(deviceID).connection { return version }
+        return nil
+    }
+
     var filteredDevice: Device? {
         deviceFilter.flatMap(device)
     }
@@ -264,6 +271,18 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
                 backoff = min(backoff * 2, 30)
             }
+        }
+    }
+
+    /// Tears down every live tunnel. Awaited from the app's terminate hook — `stopSession`
+    /// fires its disconnect in a detached `Task`, which never runs when the process is exiting.
+    func shutdownAllSessions() async {
+        let live = services
+        services.removeAll()
+        sessionTasks.values.forEach { $0.cancel() }
+        sessionTasks.removeAll()
+        for service in live.values {
+            await service.disconnect()
         }
     }
 
@@ -521,11 +540,10 @@ final class AppModel: ObservableObject {
             do {
                 let service = service(for: device)
                 var path = directory.trimmingCharacters(in: .whitespaces)
+                // The browser leaves paths slash-terminated; herdr wants them bare.
+                while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
                 if path.isEmpty { path = "~" }
-                if path == "~" || path.hasPrefix("~/") {
-                    let home = try await service.homeDirectory()
-                    path = path == "~" ? home : "\(home)/\(path.dropFirst(2))"
-                }
+                path = try await service.absolutePath(path)
                 let trimmedLabel = label?.trimmingCharacters(in: .whitespaces)
                 let created = try await service.createWorkspace(
                     label: (trimmedLabel?.isEmpty ?? true) ? nil : trimmedLabel,

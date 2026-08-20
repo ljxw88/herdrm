@@ -5,9 +5,42 @@ import Sparkle
 import SwiftUI
 import UserNotifications
 
+/// Holds app termination open long enough to tear the SSH tunnels down: without
+/// `.terminateLater` the process dies before the teardown task gets to run, and the
+/// `ssh` children survive with PPID 1 along with their sockets.
+///
+/// The delegate owns the model rather than borrowing it from the window: closing the
+/// last window (⌘W) would otherwise drop the only strong reference, and the quit that
+/// follows would find nothing left to tear down.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let model = AppModel()
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            await model.shutdownAllSessions()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
+private struct AppModelFocusedValueKey: FocusedValueKey {
+    typealias Value = AppModel
+}
+
+extension FocusedValues {
+    var appModel: AppModel? {
+        get { self[AppModelFocusedValueKey.self] }
+        set { self[AppModelFocusedValueKey.self] = newValue }
+    }
+}
+
 @main
 struct HerdrMApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @AppStorage("app.theme") private var themePreference = "system"
+    @FocusedValue(\.appModel) private var focusedModel
 
     private let updaterController: SPUStandardUpdaterController
 
@@ -25,7 +58,7 @@ struct HerdrMApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView(model: appDelegate.model)
                 .onAppear { Self.applyTheme(themePreference) }
                 .onChange(of: themePreference) { _, newValue in
                     Self.applyTheme(newValue)
@@ -34,6 +67,17 @@ struct HerdrMApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
+            // herdrm is a single-window console: a second window would duplicate the
+            // whole device tree, so New Window gives up ⌘N to the action that matters.
+            CommandGroup(replacing: .newItem) {
+                Button("New Agent") { focusedModel?.showNewAgent = true }
+                    .keyboardShortcut("n", modifiers: .command)
+                    .disabled(focusedModel == nil)
+                Button("New Space") { focusedModel?.showNewSpace = true }
+                    .keyboardShortcut("n", modifiers: [.command, .shift])
+                    .disabled(focusedModel == nil)
+            }
+
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") {
                     updaterController.checkForUpdates(nil)
@@ -91,48 +135,54 @@ struct TerminalSettingsView: View {
     private let families = TerminalDefaults.monospacedFamilies()
 
     var body: some View {
-        Form {
-            Picker("Font", selection: $fontName) {
-                Text("System Mono (SF Mono)").tag("")
-                Divider()
-                ForEach(families, id: \.self) { family in
-                    Text(family).tag(family)
+        VStack(alignment: .leading, spacing: 14) {
+            Form {
+                Picker("Font", selection: $fontName) {
+                    Text("System Mono (SF Mono)").tag("")
+                    Divider()
+                    ForEach(families, id: \.self) { family in
+                        Text(family).tag(family)
+                    }
                 }
-            }
 
-            HStack {
-                Slider(value: $fontSize, in: 9...22, step: 0.5) {
-                    Text("Size")
-                }
-                Text(String(format: "%.1f pt", fontSize))
-                    .font(.system(size: 11.5).monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 52, alignment: .trailing)
-                Stepper("", value: $fontSize, in: 9...22, step: 0.5)
-                    .labelsHidden()
-            }
-
-            Toggle(isOn: $mouseReporting) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Mouse reporting")
-                    Text("Forwards clicks and drags to TUI apps that ask for them. Turn off to always select text with the mouse — Shift-drag selects either way.")
-                        .font(.system(size: 10.5))
+                HStack {
+                    Slider(value: $fontSize, in: 9...22, step: 0.5) {
+                        Text("Size")
+                    }
+                    Text(String(format: "%.1f pt", fontSize))
+                        .font(.system(size: 11.5).monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .frame(width: 52, alignment: .trailing)
+                    Stepper("", value: $fontSize, in: 9...22, step: 0.5)
+                        .labelsHidden()
+                }
+
+                Toggle(isOn: $mouseReporting) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Mouse reporting")
+                        Text("Forwards clicks and drags to TUI apps that ask for them. Turn off to always select text with the mouse — Shift-drag selects either way.")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Button("Reset to Defaults") {
+                    fontName = ""
+                    fontSize = TerminalDefaults.defaultFontSize
+                    mouseReporting = true
                 }
             }
 
-            Button("Reset to Defaults") {
-                fontName = ""
-                fontSize = TerminalDefaults.defaultFontSize
-                mouseReporting = true
-            }
-
-            Section {
+            // Outside the Form: its two-column layout has no label for these
+            // rows and would indent them by the whole label column.
+            VStack(alignment: .leading, spacing: 6) {
                 Text("Preview")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Text("❯ herdr agent attach w1:p1 — 中文 ABC 0123")
                     .font(Font(TerminalDefaults.font(name: fontName, size: fontSize)))
+                    .lineLimit(1)
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Theme.terminalBackground, in: RoundedRectangle(cornerRadius: 6))

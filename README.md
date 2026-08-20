@@ -47,9 +47,12 @@ working, blocked, or done. **herdrm** puts a native macOS window on top of it:
 ## Requirements
 
 - macOS 14+
-- [herdr](https://herdr.dev) running locally and/or on your remote machines
+- [herdr](https://herdr.dev) installed locally (herdrm starts the local server
+  itself if it isn't running) and running on your remote machines
 - For remote devices: OpenSSH access through your SSH config/agent, Tailscale
-  SSH, or a password stored in the macOS login Keychain
+  SSH, or a password stored in the macOS login Keychain. Tailscale SSH requires
+  Tailscale 1.98.0 or newer on the remote host for Unix-socket forwarding.
+  Targets accept `user@host`, `user@host:port`, and `~/.ssh/config` aliases.
 
 ## Install
 
@@ -92,3 +95,15 @@ make kit-test  # HerdrKit integration tests (needs a running local herdr)
 - [Sparkle](https://sparkle-project.org) — auto-updates.
 - [Lobe Icons](https://github.com/lobehub/lobe-icons) and
   [Simple Icons](https://simpleicons.org) — agent and OS brand icons.
+
+## Star History
+
+<p align="center">
+  <a href="https://star-history.com/#missuo/herdrm&Date">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=missuo/herdrm&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=missuo/herdrm&type=Date" />
+      <img src="https://api.star-history.com/svg?repos=missuo/herdrm&type=Date" width="600" alt="Star History Chart for missuo/herdrm" />
+    </picture>
+  </a>
+</p>

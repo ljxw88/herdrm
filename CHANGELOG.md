@@ -7,6 +7,96 @@ the Sparkle update description — a release without a section here fails CI.
 
 ## [Unreleased]
 
+### Fixed
+- Settings → Terminal: the preview no longer sits indented by the form's label
+  column, and the mouse-reporting description no longer truncates.
+
+## [0.3.6] - 2026-08-20
+
+### Fixed
+- Terminal attach no longer fails with `protocol_mismatch` when the machine
+  has more than one herdr binary (a stale copy earlier in the PATH than the
+  one the server runs): the attach now picks the binary whose version matches
+  the server's, falling back to the first one found. herdr's attach stream
+  requires exact protocol equality — 0.8.0 speaks 19, 0.8.2 speaks 20 — while
+  the sidebar's control API tolerates the skew, which is why everything else
+  kept working. (#22)
+
+### Added
+- The New Space sheet's DIRECTORY field now carries an inline folder browser:
+  type freely, click a folder to descend, arrow-up to the parent, and typing a
+  partial name filters the listing as you go. Works on remote devices too
+  (listed over one-shot SSH); local devices keep the native Browse… panel.
+  (#20, thanks @lcandy2!)
+
+## [0.3.5] - 2026-08-20
+
+### Added
+- Custom SSH ports: enter the device target as `user@host:port` (or an
+  `ssh://` URI); plain targets and `~/.ssh/config` aliases work as before.
+- Right-click context menu in the terminal: Copy, Paste, Select All — plus
+  Open Link and Copy Link Address when the selected text contains a URL
+  (double-click selects a whole URL). (#19)
+- ⌘-click opens http(s) links under the pointer in the default browser
+  (SwiftTerm's built-in link detection; hold ⌘ to highlight). (#19)
+
+## [0.3.4] - 2026-08-20
+
+### Added
+- Dragging in the terminal now selects text locally, like a native text view —
+  no Shift needed — and a plain click dismisses the selection; copy with ⌘C.
+  Clicks and the scroll wheel still reach the TUI. Previously herdr's attach
+  stream captured every mouse event (including Shift+drag via XTSHIFTESCAPE),
+  so nothing could be selected or copied at all. (#17)
+
+### Fixed
+- Connecting to a remote whose herdr isn't running used to fail with
+  `malformed response: empty reply` — the tunnel comes up fine and ssh only
+  reports the forwarding failure after a client uses the socket. herdrm now
+  diagnoses this in two steps: a remote probe that turns the common case into
+  "herdr isn't running on <host> — start it by running \"herdr\" on that
+  machine" (and tells a stale socket or sshd's AllowStreamLocalForwarding
+  apart from it), with ssh's continuously captured stderr as the fallback for
+  everything else. (#16, thanks @0xrsydn! #18, thanks @lcandy2!)
+
+## [0.3.3] - 2026-08-20
+
+### Fixed
+- Light mode now also adapts 256-color output — Claude Code's diff and header
+  backgrounds arrive as indexed colors (`48;5;n`), which the 0.3.2 filter
+  didn't cover, so they stayed dark. Foregrounds that are already readable on
+  white keep their color; only backgrounds flip.
+
+## [0.3.2] - 2026-08-20
+
+### Fixed
+- Terminal colors now adapt to Light mode: explicit truecolor output (like
+  Codex's dark input box) is luminance-flipped before it reaches the terminal,
+  and the ANSI palette follows the theme. (#15, thanks @hhmy27!) On top of
+  that, palette entries that already read well on white — red, blue, magenta,
+  black — keep their original colors instead of washing out to pastels.
+
+## [0.3.1] - 2026-08-20
+
+### Added
+- herdrm now starts the local herdr server itself when nothing is listening on
+  the socket, instead of asking you to go run `herdr` in a terminal. (#8,
+  thanks @FacuVCanale!)
+- Shift+Enter in the agent terminal inserts a line break instead of submitting
+  — sent as ESC+CR, which coding-agent TUIs already understand. Inert when a
+  TUI negotiates the kitty keyboard protocol (it already distinguishes the
+  modifier). (#14, thanks @ccyisafool!)
+- File menu commands with keyboard shortcuts: **New Agent** (⌘N) and **New
+  Space** (⇧⌘N), reachable while the focus is inside an agent's terminal.
+  ⌘N replaces *New Window* — herdrm is a single-window console, so a second
+  window would only duplicate the device tree. (#10, thanks @alejodelosrios!)
+
+### Fixed
+- SSH tunnels are torn down when the app quits. Each launch used to leave its
+  `ssh` processes running (reparented to `launchd`) and their forwarded sockets
+  in place, so tunnels piled up across quit/relaunch cycles. (#11, thanks
+  @alejodelosrios!)
+
 ## [0.3.0] - 2026-08-19
 
 ### Added
