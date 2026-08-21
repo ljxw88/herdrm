@@ -199,6 +199,9 @@ struct DetailView: View {
 
     @AppStorage(TerminalDefaults.fontNameKey) private var terminalFontName = ""
     @AppStorage(TerminalDefaults.fontSizeKey) private var terminalFontSize = TerminalDefaults.defaultFontSize
+    @AppStorage(TerminalDefaults.thinStrokesKey) private var terminalThinStrokes = true
+    @AppStorage(TerminalDefaults.fontWeightKey) private var terminalFontWeight = TerminalDefaults.defaultFontWeight
+    @AppStorage(TerminalDefaults.lineSpacingKey) private var terminalLineSpacing = TerminalDefaults.defaultLineSpacing
     @AppStorage("terminal.mouseReporting") private var terminalMouseReporting = true
     @Environment(\.colorScheme) private var colorScheme
     /// The entry whose attach process exited, and how. Keyed by entry id so a stale
@@ -216,9 +219,15 @@ struct DetailView: View {
                     device: entry.device,
                     paneID: entry.agent.paneID,
                     serverVersion: model.serverVersion(deviceID: entry.device.id),
-                    agentKind: entry.agent.agentKindRaw,
+                    attachmentCapabilities: model.attachmentCapabilities(
+                        deviceID: entry.device.id,
+                        agentKind: entry.agent.agentKindRaw
+                    ),
                     fontName: terminalFontName,
                     fontSize: terminalFontSize,
+                    thinStrokes: terminalThinStrokes,
+                    fontWeight: terminalFontWeight,
+                    lineSpacing: terminalLineSpacing,
                     dark: colorScheme == .dark,
                     mouseReporting: terminalMouseReporting,
                     onAttachmentError: { model.actionError = $0 },

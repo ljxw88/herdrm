@@ -7,7 +7,14 @@ import UniformTypeIdentifiers
 enum TerminalDefaults {
     static let fontNameKey = "terminal.fontName"   // "" = system monospaced
     static let fontSizeKey = "terminal.fontSize"
+    static let thinStrokesKey = "terminal.thinStrokes"
+    static let fontWeightKey = "terminal.fontWeight"
+    static let lineSpacingKey = "terminal.lineSpacing"
     static let defaultFontSize: Double = 12.5
+    /// `NSFont.Weight` rawValue; 0 is `.regular`. Only the system monospaced font
+    /// has selectable weights — named families ship fixed faces and ignore this.
+    static let defaultFontWeight: Double = 0
+    static let defaultLineSpacing: Double = 1.0
     static let darkBackground = NSColor(
         srgbRed: 0x10 / 255,
         green: 0x10 / 255,
@@ -57,11 +64,11 @@ enum TerminalDefaults {
         )
     }
 
-    static func font(name: String, size: Double) -> NSFont {
+    static func font(name: String, size: Double, weight: Double = defaultFontWeight) -> NSFont {
         if !name.isEmpty, let custom = NSFont(name: name, size: size) {
             return custom
         }
-        return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        return NSFont.monospacedSystemFont(ofSize: size, weight: NSFont.Weight(weight))
     }
 
     /// Fixed-pitch font families available on this Mac, for the settings picker.
@@ -77,6 +84,11 @@ enum TerminalDefaults {
 private struct ClipboardFile: Sendable {
     let localURL: URL
     let removeAfterUpload: Bool
+}
+
+private struct PendingAttachmentPaste: Sendable {
+    let files: [ClipboardFile]
+    let pathSyntax: AgentAttachmentPathSyntax
 }
 
 private enum ClipboardFileError: LocalizedError {
@@ -227,12 +239,12 @@ final class LineBreakTerminalView: LocalProcessTerminalView {
         super.interpretKeyEvents(eventArray)
     }
 
-    var forwardsLocalImagePaste = false
-    var handlesRemoteFilePaste = false
+    var attachmentCapabilities: AgentAttachmentCapabilities?
+    var attachmentDeviceKind: Device.Kind = .local
     var attachmentService: HerdrService?
     var onAttachmentError: ((String) -> Void)?
     var onAttachmentUploadingChanged: ((Bool) -> Void)?
-    private var pendingUploads: [[ClipboardFile]] = []
+    private var pendingUploads: [PendingAttachmentPaste] = []
     private var uploadTask: Task<Void, Never>?
 
     deinit {
@@ -240,25 +252,70 @@ final class LineBreakTerminalView: LocalProcessTerminalView {
     }
 
     override func paste(_ sender: Any) {
-        if handlesRemoteFilePaste {
-            do {
-                if let files = try Self.clipboardFiles(in: NSPasteboard.general) {
-                    enqueueRemotePaste(files)
-                    return
-                }
-            } catch {
-                reportAttachmentError(error)
-                return
-            }
+        let pasteboard = NSPasteboard.general
+        if let fileURLs = Self.fileURLs(in: pasteboard), !fileURLs.isEmpty {
+            let action = AgentAttachmentDeliveryPolicy.action(
+                capabilities: attachmentCapabilities,
+                deviceKind: attachmentDeviceKind,
+                source: .files(allImages: fileURLs.allSatisfy(Self.isImageFile))
+            )
+            handleFilePaste(action: action, fileURLs: fileURLs, sender: sender)
+            return
         }
 
-        guard forwardsLocalImagePaste,
-              Self.containsImage(in: NSPasteboard.general)
-        else {
+        guard Self.containsImageData(in: pasteboard) else {
             super.paste(sender)
             return
         }
 
+        let action = AgentAttachmentDeliveryPolicy.action(
+            capabilities: attachmentCapabilities,
+            deviceKind: attachmentDeviceKind,
+            source: .imageData
+        )
+        switch action {
+        case .unsupported:
+            super.paste(sender)
+        case .nativeClipboard:
+            forwardNativeClipboardPaste()
+        case .devicePaths(let pathSyntax):
+            do {
+                guard let files = try Self.clipboardFiles(in: pasteboard) else {
+                    super.paste(sender)
+                    return
+                }
+                enqueuePathPaste(files, pathSyntax: pathSyntax)
+            } catch {
+                reportAttachmentError(error)
+            }
+        }
+    }
+
+    private func handleFilePaste(
+        action: AgentAttachmentDeliveryAction,
+        fileURLs: [URL],
+        sender: Any
+    ) {
+        switch action {
+        case .unsupported:
+            super.paste(sender)
+        case .nativeClipboard:
+            forwardNativeClipboardPaste()
+        case .devicePaths(let pathSyntax):
+            if case .local = attachmentDeviceKind {
+                sendPastedText(fileURLs.map { pathSyntax.format($0.path) }.joined(separator: " "))
+                return
+            }
+            do {
+                let files = try Self.clipboardFiles(from: fileURLs)
+                enqueuePathPaste(files, pathSyntax: pathSyntax)
+            } catch {
+                reportAttachmentError(error)
+            }
+        }
+    }
+
+    private func forwardNativeClipboardPaste() {
         guard let controlV = NSEvent.keyEvent(
             with: .keyDown,
             location: .zero,
@@ -278,41 +335,45 @@ final class LineBreakTerminalView: LocalProcessTerminalView {
         super.keyDown(with: controlV)
     }
 
-    private func enqueueRemotePaste(_ files: [ClipboardFile]) {
+    private func enqueuePathPaste(
+        _ files: [ClipboardFile],
+        pathSyntax: AgentAttachmentPathSyntax
+    ) {
         guard let attachmentService else {
             discardTemporaries(in: files)
             reportAttachmentError(ClipboardFileError.transferUnavailable)
             return
         }
-        pendingUploads.append(files)
+        pendingUploads.append(PendingAttachmentPaste(files: files, pathSyntax: pathSyntax))
         guard uploadTask == nil else { return }
         onAttachmentUploadingChanged?(true)
         uploadTask = Task { [weak self] in
-            await self?.drainUploads(using: attachmentService)
+            await self?.drainPathPastes(using: attachmentService)
         }
     }
 
-    /// Uploads one paste at a time so paths reach the agent in paste order.
+    /// Materializes one paste at a time so paths reach the agent in paste order.
     @MainActor
-    private func drainUploads(using service: HerdrService) async {
+    private func drainPathPastes(using service: HerdrService) async {
         while !pendingUploads.isEmpty {
-            let files = pendingUploads.removeFirst()
+            let paste = pendingUploads.removeFirst()
+            let files = paste.files
             defer { discardTemporaries(in: files) }
             do {
-                var remotePaths: [String] = []
+                var devicePaths: [String] = []
                 for file in files {
                     try Task.checkCancellation()
-                    remotePaths.append(try await service.stageAttachment(from: file.localURL))
+                    devicePaths.append(try await service.stageAttachment(from: file.localURL))
                 }
                 try Task.checkCancellation()
-                sendPastedText(remotePaths.joined(separator: " "))
+                sendPastedText(devicePaths.map(paste.pathSyntax.format).joined(separator: " "))
             } catch is CancellationError {
                 break
             } catch {
                 reportAttachmentError(error)
             }
         }
-        pendingUploads.forEach(discardTemporaries(in:))
+        pendingUploads.forEach { discardTemporaries(in: $0.files) }
         pendingUploads.removeAll()
         uploadTask = nil
         onAttachmentUploadingChanged?(false)
@@ -342,17 +403,8 @@ final class LineBreakTerminalView: LocalProcessTerminalView {
     }
 
     private static func clipboardFiles(in pasteboard: NSPasteboard) throws -> [ClipboardFile]? {
-        if let fileURLs = pasteboard.readObjects(
-            forClasses: [NSURL.self],
-            options: [.urlReadingFileURLsOnly: true]
-        ) as? [URL], !fileURLs.isEmpty {
-            return try fileURLs.map { url in
-                let values = try url.resourceValues(forKeys: [.isRegularFileKey])
-                guard values.isRegularFile == true else {
-                    throw ClipboardFileError.unsupportedItem
-                }
-                return ClipboardFile(localURL: url, removeAfterUpload: false)
-            }
+        if let fileURLs = fileURLs(in: pasteboard), !fileURLs.isEmpty {
+            return try clipboardFiles(from: fileURLs)
         }
 
         guard !hasText(in: pasteboard),
@@ -390,22 +442,33 @@ final class LineBreakTerminalView: LocalProcessTerminalView {
         return [ClipboardFile(localURL: localURL, removeAfterUpload: true)]
     }
 
-    private static func containsImage(in pasteboard: NSPasteboard) -> Bool {
-        if !hasText(in: pasteboard), pasteboard.canReadObject(forClasses: [NSImage.self], options: nil) {
-            return true
+    private static func clipboardFiles(from fileURLs: [URL]) throws -> [ClipboardFile] {
+        try fileURLs.map { url in
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey])
+            guard values.isRegularFile == true else {
+                throw ClipboardFileError.unsupportedItem
+            }
+            return ClipboardFile(localURL: url, removeAfterUpload: false)
         }
-        guard let fileURLs = pasteboard.readObjects(
+    }
+
+    private static func fileURLs(in pasteboard: NSPasteboard) -> [URL]? {
+        pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
-        ) as? [URL] else {
-            return false
-        }
-        return fileURLs.contains { url in
-            guard let values = try? url.resourceValues(forKeys: [.contentTypeKey]),
-                  let contentType = values.contentType
-            else { return false }
-            return contentType.conforms(to: .image)
-        }
+        ) as? [URL]
+    }
+
+    private static func containsImageData(in pasteboard: NSPasteboard) -> Bool {
+        !hasText(in: pasteboard)
+            && pasteboard.canReadObject(forClasses: [NSImage.self], options: nil)
+    }
+
+    private static func isImageFile(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.contentTypeKey]),
+              let contentType = values.contentType
+        else { return false }
+        return contentType.conforms(to: .image)
     }
 
     /// Keynote, Excel and Preview attach a TIFF snapshot to copied text, so a
@@ -421,10 +484,16 @@ struct AttachTerminalView: NSViewRepresentable {
     let paneID: String
     /// The device's herdr server version, so attach picks a matching CLI binary.
     var serverVersion: String?
-    /// nil until herdr finishes detecting the agent in a freshly started pane.
-    let agentKind: String?
+    /// nil when the server or active manifest does not advertise attachment support.
+    let attachmentCapabilities: AgentAttachmentCapabilities?
     var fontName: String = ""
     var fontSize: Double = TerminalDefaults.defaultFontSize
+    /// macOS font smoothing dilates glyph stems, which reads as fake bold at
+    /// terminal sizes. Off is SwiftTerm's `fontSmoothing = false` — iTerm2's
+    /// "Thin strokes".
+    var thinStrokes: Bool = true
+    var fontWeight: Double = TerminalDefaults.defaultFontWeight
+    var lineSpacing: Double = TerminalDefaults.defaultLineSpacing
     /// From SwiftUI's environment so theme switches re-render immediately.
     var dark: Bool = false
     /// When false, mouse drags always select text locally even if the TUI
@@ -463,6 +532,15 @@ struct AttachTerminalView: NSViewRepresentable {
             args: command.args,
             environment: environment
         )
+        // SwiftUI throws this view away and builds a new one whenever the selected
+        // agent changes (the `.id("attach-…")` in ContentView), and a fresh NSView is
+        // never first responder — so keystrokes went nowhere until the user clicked.
+        // The hop to the next runloop pass is required: while `makeNSView` runs the
+        // view has no `window` yet.
+        DispatchQueue.main.async { [weak view] in
+            guard let view, let window = view.window else { return }
+            window.makeFirstResponder(view)
+        }
         return view
     }
 
@@ -474,12 +552,11 @@ struct AttachTerminalView: NSViewRepresentable {
         configureAppearance(nsView)
     }
 
-    /// Re-applied on update: herdr reports the agent kind as nil until detection
-    /// lands, and the view identity doesn't change when it does.
+    /// Re-applied on update because capabilities can arrive after the terminal
+    /// view is created, without changing its identity.
     private func configurePasteHandling(_ view: LineBreakTerminalView) {
-        let acceptsAttachments = AgentInfo.acceptsPastedAttachments(agentKind: agentKind)
-        view.forwardsLocalImagePaste = device.isLocal && acceptsAttachments
-        view.handlesRemoteFilePaste = !device.isLocal && acceptsAttachments
+        view.attachmentCapabilities = attachmentCapabilities
+        view.attachmentDeviceKind = device.kind
         view.onAttachmentError = onAttachmentError
         view.onAttachmentUploadingChanged = onAttachmentUploadingChanged
     }
@@ -491,11 +568,23 @@ struct AttachTerminalView: NSViewRepresentable {
     }
 
     private func configureAppearance(_ view: LocalProcessTerminalView) {
-        let font = TerminalDefaults.font(name: fontName, size: fontSize)
+        let font = TerminalDefaults.font(name: fontName, size: fontSize, weight: fontWeight)
         if view.font != font {
             view.font = font
         }
         view.allowMouseReporting = mouseReporting
+        // Compared against the inverted value on purpose: thinStrokes on means
+        // smoothing off. The setter only stores the flag, so repaint by hand.
+        if view.fontSmoothing == thinStrokes {
+            view.fontSmoothing = !thinStrokes
+            view.needsDisplay = true
+        }
+        // This setter calls resetFont(), which recomputes metrics and resizes the
+        // terminal, so it is only assigned when it actually changes.
+        if view.lineSpacing != CGFloat(lineSpacing) {
+            view.lineSpacing = CGFloat(lineSpacing)
+        }
+        // Everything below is theme-only and returns early; keep font work above it.
         guard let view = view as? LineBreakTerminalView,
               view.appliedDarkAppearance != dark
         else { return }

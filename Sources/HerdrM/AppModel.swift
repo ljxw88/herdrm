@@ -28,6 +28,7 @@ struct DeviceSessionState {
     var panes: [PaneInfo] = []
     var agentKinds: [String] = []
     var installedAgentKinds: [String] = []
+    var attachmentCapabilities = AgentAttachmentCapabilityRegistry()
 }
 
 struct SSHAuthenticationRequest: Identifiable {
@@ -91,6 +92,13 @@ final class AppModel: ObservableObject {
     func serverVersion(deviceID: UUID) -> String? {
         if case .connected(let version) = session(deviceID).connection { return version }
         return nil
+    }
+
+    func attachmentCapabilities(
+        deviceID: UUID,
+        agentKind: String?
+    ) -> AgentAttachmentCapabilities? {
+        session(deviceID).attachmentCapabilities.capabilities(for: agentKind)
     }
 
     var filteredDevice: Device? {
@@ -247,9 +255,11 @@ final class AppModel: ObservableObject {
                         self.probeOSIfNeeded(current)
                     }
                     await self.refresh(device.id)
-                    if self.sessions[device.id]?.agentKinds.isEmpty ?? true {
-                        let kinds = (try? await service.agentKinds()) ?? []
+                    if let manifests = try? await service.agentManifests() {
+                        let kinds = manifests.map(\.agent)
                         self.sessions[device.id]?.agentKinds = kinds
+                        self.sessions[device.id]?.attachmentCapabilities =
+                            AgentAttachmentCapabilityRegistry(manifests: manifests)
                         self.sessions[device.id]?.installedAgentKinds =
                             (try? await service.installedAgentKinds(from: kinds)) ?? []
                     }
@@ -475,6 +485,27 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// An action fired while the device session is down surfaces the bare
+    /// "connection failed: not connected", which points at nothing. The
+    /// reconnect loop already knows why the device is unreachable — say that
+    /// instead. (#21)
+    func actionErrorMessage(_ error: Error, device: Device) -> String {
+        guard let herdrError = error as? HerdrError,
+              case .connectionFailed(let reason) = herdrError,
+              reason == "not connected"
+        else { return error.localizedDescription }
+        switch session(device.id).connection {
+        case .connecting:
+            return "Still connecting to \(device.name) — try again in a moment."
+        case .failed(let reason):
+            return "\(device.name) is unreachable: \(reason)"
+        case .idle:
+            return "\(device.name) isn't connected."
+        case .connected:
+            return "\(device.name) just reconnected — try again."
+        }
+    }
+
     // MARK: - Closing
 
     func requestCloseSpace(_ entry: SpaceEntry) {
@@ -490,7 +521,7 @@ final class AppModel: ObservableObject {
                     if self.selectedSpace == entry.ref { self.selectedSpace = nil }
                     await self.refresh(entry.device.id)
                 } catch {
-                    self.actionError = error.localizedDescription
+                    self.actionError = self.actionErrorMessage(error, device: entry.device)
                 }
             }
         }
@@ -509,7 +540,7 @@ final class AppModel: ObservableObject {
                     if self.selectedPane == ref { self.selectedPane = nil }
                     await self.refresh(device.id)
                 } catch {
-                    self.actionError = error.localizedDescription
+                    self.actionError = self.actionErrorMessage(error, device: device)
                 }
             }
         }
@@ -528,7 +559,7 @@ final class AppModel: ObservableObject {
                 )
                 await refresh(entry.device.id)
             } catch {
-                actionError = error.localizedDescription
+                actionError = actionErrorMessage(error, device: entry.device)
             }
         }
     }
@@ -553,7 +584,7 @@ final class AppModel: ObservableObject {
                 selectedSpace = SpaceRef(deviceID: device.id, workspaceID: created.workspaceID)
                 showNewAgent = true
             } catch {
-                actionError = error.localizedDescription
+                actionError = actionErrorMessage(error, device: device)
             }
         }
     }
@@ -561,7 +592,12 @@ final class AppModel: ObservableObject {
     /// New Agent: a fresh tab in the space plus agent.start. Agent names are
     /// session-global in herdr, so collisions retry with a unique suffix.
     /// `bypass` appends the kind's skip-permissions flag when one is known.
-    func startNewAgent(device: Device, kind: String, workspaceID: String?, bypass: Bool) {
+    func startNewAgent(
+        device: Device,
+        kind: String,
+        workspaceID: String?,
+        bypass: Bool
+    ) {
         let args = bypass ? (HerdrService.bypassFlags(for: kind) ?? []) : []
         Task {
             let service = service(for: device)
@@ -593,7 +629,7 @@ final class AppModel: ObservableObject {
                 if let createdPane {
                     try? await service.closePane(paneID: createdPane)
                 }
-                actionError = error.localizedDescription
+                actionError = actionErrorMessage(error, device: device)
             }
         }
     }
