@@ -5,7 +5,26 @@ on [Keep a Changelog](https://keepachangelog.com); versions follow semver.
 Release automation extracts the matching section for GitHub release notes and
 the Sparkle update description — a release without a section here fails CI.
 
-## [Unreleased]
+## [0.6.3] - 2026-09-10
+
+### Fixed
+- Terminal text — most visibly CJK — no longer renders pale/faint. The
+  keep-alive rework wrapped every attached terminal in `.opacity`, which
+  forces SwiftUI to composite it offscreen; there, glyph anti-aliasing on
+  Ghostty's non-opaque (clear) Metal layer fell back to a transparent
+  backdrop and came out thin and gray, worst on dense Chinese strokes. A
+  solid terminal-background backdrop inside the compositing group restores
+  full-contrast text, matching the pre-keep-alive rendering.
+
+## [0.6.2] - 2026-09-10
+
+### Changed
+- Switching between agents (and herdr terminals) now preserves each one's live
+  terminal instead of re-attaching it. Every pane you open stays mounted and
+  hidden, so switching back is instant and its scrollback and running state
+  survive the round trip — no takeover churn, no redraw. A pane's kept-alive
+  view is dropped when its pane actually closes. (thanks @lbr77 for the
+  reference implementation!)
 
 ### Fixed
 - Agent working / blocked / done indicators now update from herdr 0.9's
