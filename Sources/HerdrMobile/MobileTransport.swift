@@ -7,7 +7,7 @@ import HerdrSSH
 /// `direct-streamlocal` channel per RPC (herdr is one-request-per-connection),
 /// or the tailcat tunnel re-served on a local Unix socket by the embedded
 /// bridge (same NDJSON API, no shell).
-protocol MobileTransport: Sendable {
+protocol MobileTransport: AnyObject, Sendable {
     func request(method: String, params: JSONValue) async throws -> JSONValue
     func events(kinds: [String], statusPaneIDs: [String]) -> AsyncThrowingStream<HerdrEvent, Error>
     func openTerminal(command: String, columns: Int, rows: Int) async throws -> SSHPTYChannel
@@ -166,43 +166,80 @@ final class SSHDirectTransport: MobileTransport {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let channel = try await connection.openStreamLocal(
-                        socketPath: socketPath, timeout: .seconds(10)
-                    )
-                    defer { Task { try? await channel.close(timeout: .seconds(2)) } }
-                    let subscribe = SocketRPC.eventSubscriptionParams(
-                        kinds: kinds,
-                        statusPaneIDs: statusPaneIDs
-                    )
-                    try await channel.write(
-                        SocketRPC.encodeRequest(id: "events", method: "events.subscribe", params: subscribe),
-                        timeout: .seconds(10)
-                    )
-                    var buffer = Data()
-                    var sawAck = false
-                    while !Task.isCancelled {
-                        // Long timeout: herdr only writes when something happens.
-                        guard let chunk = try await channel.read(timeout: .seconds(3600)) else { break }
-                        buffer.append(chunk)
-                        while let index = buffer.firstIndex(of: 0x0A) {
-                            let line = buffer.prefix(upTo: index)
-                            buffer.removeSubrange(...index)
-                            guard !line.isEmpty else { continue }
-                            guard sawAck else {
-                                _ = try SocketRPC.decodeResponse(Data(line))
-                                sawAck = true
-                                continuation.yield(HerdrEvent(
-                                    kind: HerdrEvent.subscriptionStartedKind,
-                                    payload: .object([:])
-                                ))
-                                continue
+                    var scopedPaneIDs = statusPaneIDs
+                    subscriptionAttempt: while !Task.isCancelled {
+                        let channel = try await connection.openStreamLocal(
+                            socketPath: socketPath, timeout: .seconds(10)
+                        )
+                        var retryWithoutScopedStatus = false
+                        do {
+                            let subscribe = SocketRPC.eventSubscriptionParams(
+                                kinds: kinds,
+                                statusPaneIDs: scopedPaneIDs
+                            )
+                            try await channel.write(
+                                SocketRPC.encodeRequest(
+                                    id: "events",
+                                    method: "events.subscribe",
+                                    params: subscribe
+                                ),
+                                timeout: .seconds(10)
+                            )
+                            var buffer = Data()
+                            var sawAck = false
+                            eventRead: while !Task.isCancelled {
+                                // Long timeout: herdr only writes when something happens.
+                                guard let chunk = try await channel.read(timeout: .seconds(3600)) else { break }
+                                buffer.append(chunk)
+                                while let index = buffer.firstIndex(of: 0x0A) {
+                                    let line = buffer.prefix(upTo: index)
+                                    buffer.removeSubrange(...index)
+                                    guard !line.isEmpty else { continue }
+                                    guard sawAck else {
+                                        do {
+                                            _ = try SocketRPC.decodeResponse(Data(line))
+                                        } catch where SocketRPC.shouldRetryStatusSubscription(
+                                            after: error,
+                                            statusPaneIDs: scopedPaneIDs
+                                        ) {
+                                            retryWithoutScopedStatus = true
+                                            break eventRead
+                                        }
+                                        sawAck = true
+                                        continuation.yield(HerdrEvent(
+                                            kind: HerdrEvent.subscriptionStartedKind,
+                                            payload: .object([:])
+                                        ))
+                                        continue
+                                    }
+                                    if let event = SocketRPC.decodeEvent(Data(line)) {
+                                        continuation.yield(event)
+                                    }
+                                }
                             }
-                            if let event = SocketRPC.decodeEvent(Data(line)) {
-                                continuation.yield(event)
-                            }
+                        } catch {
+                            try? await channel.close(timeout: .seconds(2))
+                            throw error
                         }
+                        try? await channel.close(timeout: .seconds(2))
+                        if retryWithoutScopedStatus {
+                            scopedPaneIDs = []
+                            continue subscriptionAttempt
+                        }
+                        if Task.isCancelled {
+                            continuation.finish()
+                        } else {
+                            continuation.finish(throwing: HerdrError.connectionFailed(
+                                "event stream ended"
+                            ))
+                        }
+                        return
                     }
-                    continuation.finish()
+                    if !Task.isCancelled {
+                        continuation.finish()
+                    } else {
+                        continuation.finish()
+                    }
                 } catch {
                     continuation.finish(throwing: error)
                 }

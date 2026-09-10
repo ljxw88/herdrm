@@ -48,6 +48,24 @@ public struct AgentInfo: Codable, Sendable, Identifiable, Equatable {
     /// Sidebar / titlebar label without a tab label. Prefer `title(tabLabel:)`.
     public var title: String { title(tabLabel: nil) }
 
+    public func updatingStatus(_ status: AgentStatus) -> AgentInfo {
+        AgentInfo(
+            terminalID: terminalID,
+            agentKindRaw: agentKindRaw,
+            name: name,
+            customTitle: customTitle,
+            terminalTitle: terminalTitle,
+            terminalTitleStripped: terminalTitleStripped,
+            agentStatusRaw: status.rawValue,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            paneID: paneID,
+            focused: focused,
+            cwd: cwd,
+            revision: revision
+        )
+    }
+
     /// Sidebar / titlebar label.
     ///
     /// `agent.rename` only accepts `[a-z][a-z0-9_-]{0,31}` so Chinese display
@@ -254,6 +272,24 @@ public struct SessionSnapshot: Codable, Sendable, Equatable {
         }
     }
 
+    public func updatingAgentStatus(paneID: String, status: AgentStatus) -> SessionSnapshot? {
+        var agents = agents
+        guard let index = agents.firstIndex(where: { $0.paneID == paneID }) else {
+            return nil
+        }
+        agents[index] = agents[index].updatingStatus(status)
+        return SessionSnapshot(
+            agents: agents,
+            workspaces: workspaces,
+            tabs: tabs,
+            panes: panes,
+            focusedPaneID: focusedPaneID,
+            focusedWorkspaceID: focusedWorkspaceID,
+            version: version,
+            protocolVersion: protocolVersion
+        )
+    }
+
     enum CodingKeys: String, CodingKey {
         case agents
         case workspaces
@@ -301,8 +337,17 @@ public struct HerdrEvent: Sendable {
         "layout.updated",
     ]
 
-    private static let normalizedKinds = Dictionary(uniqueKeysWithValues:
-        allKinds.map { ($0.replacingOccurrences(of: ".", with: "_"), $0) }
+    private static let scopedKinds = [
+        agentStatusChangedKind,
+        "pane.scroll_changed",
+        "pane.output_matched",
+    ]
+
+    private static let normalizedKinds = Dictionary(
+        (allKinds + scopedKinds).map {
+            ($0.replacingOccurrences(of: ".", with: "_"), $0)
+        },
+        uniquingKeysWith: { first, _ in first }
     )
 
     static func normalizedKind(_ wireKind: String) -> String {

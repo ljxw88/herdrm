@@ -43,42 +43,91 @@ public struct SocketRPC: Sendable {
     ) -> AsyncThrowingStream<HerdrEvent, Error> {
         let path = socketPath
         return AsyncThrowingStream { continuation in
+            let socketHandle = EventSocketHandle()
             let task = Task.detached(priority: .utility) {
-                var fd: Int32 = -1
+                var scopedPaneIDs = statusPaneIDs
                 do {
-                    fd = try Self.connect(path: path)
-                    let subs = Self.eventSubscriptionParams(
-                        kinds: kinds,
-                        statusPaneIDs: statusPaneIDs
-                    )
-                    try Self.writeLine(fd: fd, data: Self.encodeRequest(id: "events", method: "events.subscribe", params: subs))
-                    // A single read() can contain the acknowledgement and one or
-                    // more events. Keep the buffer used for the acknowledgement so
-                    // those already-received events are not discarded.
-                    var buffer = Data()
-                    let ack = try Self.readLine(fd: fd, timeoutSeconds: 15, buffer: &buffer)
-                    _ = try Self.decodeResponse(ack)
-                    // The caller takes a fresh snapshot after this marker. The
-                    // subscription is already active, so that closes the
-                    // documented snapshot/subscription bootstrap gap.
-                    continuation.yield(HerdrEvent(
-                        kind: HerdrEvent.subscriptionStartedKind,
-                        payload: .object([:])
-                    ))
-                    while !Task.isCancelled {
-                        guard let line = try Self.readLine(fd: fd, timeoutSeconds: nil, buffer: &buffer) else { break }
-                        guard !line.isEmpty else { continue }
-                        if let event = Self.decodeEvent(line) {
-                            continuation.yield(event)
+                    subscriptionAttempt: while !Task.isCancelled {
+                        var fd: Int32 = -1
+                        do {
+                            fd = try Self.connect(path: path)
+                            guard socketHandle.install(fd) else {
+                                close(fd)
+                                continuation.finish()
+                                return
+                            }
+                            let subs = Self.eventSubscriptionParams(
+                                kinds: kinds,
+                                statusPaneIDs: scopedPaneIDs
+                            )
+                            try Self.writeLine(
+                                fd: fd,
+                                data: Self.encodeRequest(
+                                    id: "events",
+                                    method: "events.subscribe",
+                                    params: subs
+                                )
+                            )
+                            // A single read() can contain the acknowledgement and one or
+                            // more events. Keep the buffer used for the acknowledgement so
+                            // those already-received events are not discarded.
+                            var buffer = Data()
+                            let ack = try Self.readLine(
+                                fd: fd,
+                                timeoutSeconds: 15,
+                                buffer: &buffer
+                            )
+                            do {
+                                _ = try Self.decodeResponse(ack)
+                            } catch where Self.shouldRetryStatusSubscription(
+                                after: error,
+                                statusPaneIDs: scopedPaneIDs
+                            ) {
+                                // A pane can close after the snapshot and before
+                                // subscribe. Keep lifecycle events alive for one
+                                // cycle; subscription.started makes the caller
+                                // re-snapshot and reopen with the corrected set.
+                                socketHandle.closeIfOwned(fd)
+                                fd = -1
+                                scopedPaneIDs = []
+                                continue subscriptionAttempt
+                            }
+                            continuation.yield(HerdrEvent(
+                                kind: HerdrEvent.subscriptionStartedKind,
+                                payload: .object([:])
+                            ))
+                            while !Task.isCancelled {
+                                guard let line = try Self.readLine(
+                                    fd: fd,
+                                    timeoutSeconds: nil,
+                                    buffer: &buffer
+                                ) else { break }
+                                guard !line.isEmpty else { continue }
+                                if let event = Self.decodeEvent(line) {
+                                    continuation.yield(event)
+                                }
+                            }
+                            if fd >= 0 {
+                                socketHandle.closeIfOwned(fd)
+                            }
+                            continuation.finish()
+                            return
+                        } catch {
+                            if fd >= 0 {
+                                socketHandle.closeIfOwned(fd)
+                            }
+                            throw error
                         }
                     }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
-                if fd >= 0 { close(fd) }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.onTermination = { _ in
+                task.cancel()
+                socketHandle.terminate()
+            }
         }
     }
 
@@ -108,6 +157,16 @@ public struct SocketRPC: Sendable {
             ?? value["kind"]?.stringValue
             ?? "unknown"
         return HerdrEvent(kind: HerdrEvent.normalizedKind(rawKind), payload: value)
+    }
+
+    public static func shouldRetryStatusSubscription(
+        after error: Error,
+        statusPaneIDs: [String]
+    ) -> Bool {
+        guard !statusPaneIDs.isEmpty,
+              case HerdrError.rpc(let code, _) = error
+        else { return false }
+        return code == "pane_not_found"
     }
 
     // MARK: - Wire helpers
@@ -173,6 +232,7 @@ public struct SocketRPC: Sendable {
                 Darwin.connect(fd, sa, len)
             }
         }
+
         guard rc == 0 else {
             let reason = String(cString: strerror(errno))
             close(fd)
@@ -189,6 +249,43 @@ public struct SocketRPC: Sendable {
             }
             guard written > 0 else { throw HerdrError.connectionFailed("write(): \(String(cString: strerror(errno)))") }
             remaining = remaining.dropFirst(written)
+        }
+    }
+
+    private final class EventSocketHandle: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fd: Int32 = -1
+        private var terminated = false
+
+        func install(_ fd: Int32) -> Bool {
+            lock.lock()
+            guard !terminated else {
+                lock.unlock()
+                return false
+            }
+            self.fd = fd
+            lock.unlock()
+            return true
+        }
+
+        func closeIfOwned(_ expected: Int32) {
+            lock.lock()
+            let owned = fd == expected ? fd : -1
+            if owned >= 0 { fd = -1 }
+            lock.unlock()
+            if owned >= 0 { close(owned) }
+        }
+
+        func terminate() {
+            lock.lock()
+            terminated = true
+            let current = fd
+            fd = -1
+            lock.unlock()
+            if current >= 0 {
+                Darwin.shutdown(current, SHUT_RDWR)
+                close(current)
+            }
         }
     }
 
