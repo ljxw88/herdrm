@@ -37,16 +37,20 @@ public struct SocketRPC: Sendable {
 
     /// Opens a persistent connection, sends events.subscribe, and yields each event line.
     /// The stream finishes when the connection drops; callers own reconnect policy.
-    public func events(kinds: [String] = HerdrEvent.allKinds) -> AsyncThrowingStream<HerdrEvent, Error> {
+    public func events(
+        kinds: [String] = HerdrEvent.allKinds,
+        statusPaneIDs: [String] = []
+    ) -> AsyncThrowingStream<HerdrEvent, Error> {
         let path = socketPath
         return AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .utility) {
                 var fd: Int32 = -1
                 do {
                     fd = try Self.connect(path: path)
-                    let subs = JSONValue.object([
-                        "subscriptions": .array(kinds.map { .object(["type": .string($0)]) })
-                    ])
+                    let subs = Self.eventSubscriptionParams(
+                        kinds: kinds,
+                        statusPaneIDs: statusPaneIDs
+                    )
                     try Self.writeLine(fd: fd, data: Self.encodeRequest(id: "events", method: "events.subscribe", params: subs))
                     // A single read() can contain the acknowledgement and one or
                     // more events. Keep the buffer used for the acknowledgement so
@@ -54,15 +58,18 @@ public struct SocketRPC: Sendable {
                     var buffer = Data()
                     let ack = try Self.readLine(fd: fd, timeoutSeconds: 15, buffer: &buffer)
                     _ = try Self.decodeResponse(ack)
+                    // The caller takes a fresh snapshot after this marker. The
+                    // subscription is already active, so that closes the
+                    // documented snapshot/subscription bootstrap gap.
+                    continuation.yield(HerdrEvent(
+                        kind: HerdrEvent.subscriptionStartedKind,
+                        payload: .object([:])
+                    ))
                     while !Task.isCancelled {
                         guard let line = try Self.readLine(fd: fd, timeoutSeconds: nil, buffer: &buffer) else { break }
                         guard !line.isEmpty else { continue }
-                        if let value = try? JSONDecoder().decode(JSONValue.self, from: line) {
-                            let kind = value["event"]?["type"]?.stringValue
-                                ?? value["type"]?.stringValue
-                                ?? value["kind"]?.stringValue
-                                ?? "unknown"
-                            continuation.yield(HerdrEvent(kind: kind, payload: value))
+                        if let event = Self.decodeEvent(line) {
+                            continuation.yield(event)
                         }
                     }
                     continuation.finish()
@@ -73,6 +80,34 @@ public struct SocketRPC: Sendable {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    public static func eventSubscriptionParams(
+        kinds: [String],
+        statusPaneIDs: [String]
+    ) -> JSONValue {
+        var subscriptions = kinds.map {
+            JSONValue.object(["type": .string($0)])
+        }
+        subscriptions.append(contentsOf: Set(statusPaneIDs).sorted().map {
+            JSONValue.object([
+                "type": .string(HerdrEvent.agentStatusChangedKind),
+                "pane_id": .string($0),
+            ])
+        })
+        return .object(["subscriptions": .array(subscriptions)])
+    }
+
+    public static func decodeEvent(_ line: Data) -> HerdrEvent? {
+        guard let value = try? JSONDecoder().decode(JSONValue.self, from: line) else {
+            return nil
+        }
+        let rawKind = value["event"]?.stringValue
+            ?? value["event"]?["type"]?.stringValue
+            ?? value["type"]?.stringValue
+            ?? value["kind"]?.stringValue
+            ?? "unknown"
+        return HerdrEvent(kind: HerdrEvent.normalizedKind(rawKind), payload: value)
     }
 
     // MARK: - Wire helpers

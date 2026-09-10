@@ -9,7 +9,7 @@ import HerdrSSH
 /// bridge (same NDJSON API, no shell).
 protocol MobileTransport: Sendable {
     func request(method: String, params: JSONValue) async throws -> JSONValue
-    func events(kinds: [String]) -> AsyncThrowingStream<HerdrEvent, Error>
+    func events(kinds: [String], statusPaneIDs: [String]) -> AsyncThrowingStream<HerdrEvent, Error>
     func openTerminal(command: String, columns: Int, rows: Int) async throws -> SSHPTYChannel
     func close() async
 }
@@ -157,7 +157,10 @@ final class SSHDirectTransport: MobileTransport {
         return try SocketRPC.decodeResponse(line)
     }
 
-    func events(kinds: [String]) -> AsyncThrowingStream<HerdrEvent, Error> {
+    func events(
+        kinds: [String],
+        statusPaneIDs: [String]
+    ) -> AsyncThrowingStream<HerdrEvent, Error> {
         let connection = connection
         let socketPath = socketPath
         return AsyncThrowingStream { continuation in
@@ -167,9 +170,10 @@ final class SSHDirectTransport: MobileTransport {
                         socketPath: socketPath, timeout: .seconds(10)
                     )
                     defer { Task { try? await channel.close(timeout: .seconds(2)) } }
-                    let subscribe = JSONValue.object([
-                        "subscriptions": .array(kinds.map { .object(["type": .string($0)]) })
-                    ])
+                    let subscribe = SocketRPC.eventSubscriptionParams(
+                        kinds: kinds,
+                        statusPaneIDs: statusPaneIDs
+                    )
                     try await channel.write(
                         SocketRPC.encodeRequest(id: "events", method: "events.subscribe", params: subscribe),
                         timeout: .seconds(10)
@@ -185,15 +189,16 @@ final class SSHDirectTransport: MobileTransport {
                             buffer.removeSubrange(...index)
                             guard !line.isEmpty else { continue }
                             guard sawAck else {
-                                sawAck = true  // first line is the subscribe ack
+                                _ = try SocketRPC.decodeResponse(Data(line))
+                                sawAck = true
+                                continuation.yield(HerdrEvent(
+                                    kind: HerdrEvent.subscriptionStartedKind,
+                                    payload: .object([:])
+                                ))
                                 continue
                             }
-                            if let value = try? JSONDecoder().decode(JSONValue.self, from: line) {
-                                let kind = value["event"]?["type"]?.stringValue
-                                    ?? value["type"]?.stringValue
-                                    ?? value["kind"]?.stringValue
-                                    ?? "unknown"
-                                continuation.yield(HerdrEvent(kind: kind, payload: value))
+                            if let event = SocketRPC.decodeEvent(Data(line)) {
+                                continuation.yield(event)
                             }
                         }
                     }
@@ -261,8 +266,11 @@ final class TailcatMobileTransport: MobileTransport {
         }
     }
 
-    func events(kinds: [String]) -> AsyncThrowingStream<HerdrEvent, Error> {
-        rpc.events(kinds: kinds)
+    func events(
+        kinds: [String],
+        statusPaneIDs: [String]
+    ) -> AsyncThrowingStream<HerdrEvent, Error> {
+        rpc.events(kinds: kinds, statusPaneIDs: statusPaneIDs)
     }
 
     func openTerminal(command _: String, columns _: Int, rows _: Int) async throws -> SSHPTYChannel {

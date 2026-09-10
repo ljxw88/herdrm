@@ -87,8 +87,34 @@ final class MobileDeviceSession {
         eventTask?.cancel()
         eventTask = Task { [weak self] in
             do {
-                for try await _ in transport.events(kinds: HerdrEvent.allKinds) {
-                    await self?.scheduleRefresh()
+                eventSubscriptions: while !Task.isCancelled {
+                    guard let self else { return }
+                    let subscribedPaneIDs = self.statusSubscriptionPaneIDs
+                    let stream = transport.events(
+                        kinds: HerdrEvent.allKinds,
+                        statusPaneIDs: subscribedPaneIDs
+                    )
+                    var needsResubscribe = false
+                    for try await event in stream {
+                        guard !Task.isCancelled else { return }
+                        if event.kind == HerdrEvent.subscriptionStartedKind
+                            || event.kind == HerdrEvent.agentStatusChangedKind
+                            || Self.paneTopologyEventKinds.contains(event.kind) {
+                            await self.refresh()
+                        } else {
+                            await self.scheduleRefresh()
+                        }
+
+                        if event.kind == HerdrEvent.subscriptionStartedKind
+                            || Self.paneTopologyEventKinds.contains(event.kind),
+                           self.statusSubscriptionPaneIDs != subscribedPaneIDs {
+                            needsResubscribe = true
+                            break
+                        }
+                    }
+                    if needsResubscribe { continue eventSubscriptions }
+                    guard !Task.isCancelled else { return }
+                    throw HerdrError.connectionFailed("event stream ended")
                 }
             } catch {}
             // Stream ended: the connection is likely gone. Reflect it so the
@@ -109,6 +135,21 @@ final class MobileDeviceSession {
         refreshPending = false
         await refresh()
     }
+
+    private var statusSubscriptionPaneIDs: [String] {
+        guard let snapshot else { return [] }
+        return Array(Set(
+            snapshot.agents.map(\.paneID)
+                + (snapshot.panes ?? []).map(\.paneID)
+        )).sorted()
+    }
+
+    private static let paneTopologyEventKinds: Set<String> = [
+        "pane.created",
+        "pane.closed",
+        "pane.moved",
+        "pane.agent_detected",
+    ]
 }
 
 @MainActor

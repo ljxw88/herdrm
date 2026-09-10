@@ -180,6 +180,7 @@ final class AppModel: ObservableObject {
     private var services: [UUID: HerdrService] = [:]
     private var sessionTasks: [UUID: Task<Void, Never>] = [:]
     private var refreshDebounces: [UUID: Task<Void, Never>] = [:]
+    private var refreshDebounceTokens: [UUID: UUID] = [:]
     private var previousStatuses: [UUID: [String: AgentStatus]] = [:]
 
     init() {
@@ -635,9 +636,32 @@ final class AppModel: ObservableObject {
                     }
                     await self.refresh(device.id)
                     await self.loadAgentCatalog(deviceID: device.id, using: service)
-                    let stream = try await service.events()
-                    for try await _ in stream {
-                        self.scheduleRefresh(device.id)
+                    eventSubscriptions: while !Task.isCancelled {
+                        let subscribedPaneIDs = self.statusSubscriptionPaneIDs(device.id)
+                        let stream = try await service.events(statusPaneIDs: subscribedPaneIDs)
+                        var needsResubscribe = false
+                        for try await event in stream {
+                            guard !Task.isCancelled else { return }
+                            if event.kind == HerdrEvent.subscriptionStartedKind
+                                || event.kind == HerdrEvent.agentStatusChangedKind
+                                || Self.paneTopologyEventKinds.contains(event.kind) {
+                                await self.refreshImmediately(device.id)
+                            } else {
+                                self.scheduleRefresh(device.id)
+                            }
+
+                            if event.kind == HerdrEvent.subscriptionStartedKind
+                                || Self.paneTopologyEventKinds.contains(event.kind) {
+                                let currentPaneIDs = self.statusSubscriptionPaneIDs(device.id)
+                                if currentPaneIDs != subscribedPaneIDs {
+                                    needsResubscribe = true
+                                    break
+                                }
+                            }
+                        }
+                        if needsResubscribe { continue eventSubscriptions }
+                        guard !Task.isCancelled else { return }
+                        throw HerdrError.connectionFailed("event stream ended")
                     }
                 } catch {
                     self.sessions[device.id]?.connection = .failed(error.localizedDescription)
@@ -719,6 +743,7 @@ final class AppModel: ObservableObject {
         sessionTasks[id] = nil
         refreshDebounces[id]?.cancel()
         refreshDebounces[id] = nil
+        refreshDebounceTokens[id] = nil
         previousStatuses[id] = nil
         let service = services[id]
         services[id] = nil
@@ -883,13 +908,45 @@ final class AppModel: ObservableObject {
     }
 
     private func scheduleRefresh(_ deviceID: UUID) {
-        refreshDebounces[deviceID]?.cancel()
-        refreshDebounces[deviceID] = Task {
+        // Coalesce from the leading edge instead of resetting the timer for
+        // every event. A busy pane can emit continuously; a trailing debounce
+        // would never fire until output stopped, hiding the working state.
+        guard refreshDebounces[deviceID] == nil else { return }
+        let token = UUID()
+        refreshDebounceTokens[deviceID] = token
+        refreshDebounces[deviceID] = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 200_000_000)
-            guard !Task.isCancelled else { return }
+            guard let self, !Task.isCancelled,
+                  self.refreshDebounceTokens[deviceID] == token
+            else { return }
             await self.refresh(deviceID)
+            if self.refreshDebounceTokens[deviceID] == token {
+                self.refreshDebounceTokens[deviceID] = nil
+                self.refreshDebounces[deviceID] = nil
+            }
         }
     }
+
+    private func refreshImmediately(_ deviceID: UUID) async {
+        refreshDebounces[deviceID]?.cancel()
+        refreshDebounces[deviceID] = nil
+        refreshDebounceTokens[deviceID] = nil
+        await refresh(deviceID)
+    }
+
+    private func statusSubscriptionPaneIDs(_ deviceID: UUID) -> [String] {
+        Array(Set(
+            session(deviceID).agents.map(\.paneID)
+                + session(deviceID).panes.map(\.paneID)
+        )).sorted()
+    }
+
+    private static let paneTopologyEventKinds: Set<String> = [
+        "pane.created",
+        "pane.closed",
+        "pane.moved",
+        "pane.agent_detected",
+    ]
 
     /// Notifies when an agent newly becomes blocked (needs input) or done (finished
     /// while unwatched). Initial snapshots don't notify — only real transitions do.

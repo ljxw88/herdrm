@@ -1,6 +1,6 @@
 import Foundation
 
-/// Agent status buckets as reported by herdr (protocol 19).
+/// Agent status buckets reported by herdr snapshots and status events.
 public enum AgentStatus: String, Codable, Sendable, CaseIterable {
     case idle
     case working
@@ -285,10 +285,12 @@ public struct HerdrEvent: Sendable {
         self.payload = payload
     }
 
-    /// All parameterless (globally subscribable) kinds in herdr protocol 19.
-    /// pane.agent_status_changed / pane.scroll_changed / pane.output_matched are
-    /// pane-scoped (require pane_id) and are deliberately absent; status changes
-    /// surface globally via pane.updated.
+    public static let subscriptionStartedKind = "subscription.started"
+    public static let agentStatusChangedKind = "pane.agent_status_changed"
+
+    /// All parameterless (globally subscribable) lifecycle kinds.
+    /// `pane.agent_status_changed` is pane-scoped and appended separately for
+    /// each known pane by `SocketRPC.events`.
     public static let allKinds: [String] = [
         "workspace.created", "workspace.updated", "workspace.metadata_updated", "workspace.renamed",
         "workspace.moved", "workspace.reordered", "workspace.focused", "workspace.closed",
@@ -298,6 +300,14 @@ public struct HerdrEvent: Sendable {
         "pane.agent_detected",
         "layout.updated",
     ]
+
+    private static let normalizedKinds = Dictionary(uniqueKeysWithValues:
+        allKinds.map { ($0.replacingOccurrences(of: ".", with: "_"), $0) }
+    )
+
+    static func normalizedKind(_ wireKind: String) -> String {
+        normalizedKinds[wireKind] ?? wireKind
+    }
 }
 
 public enum HerdrError: Error, LocalizedError, Sendable {
